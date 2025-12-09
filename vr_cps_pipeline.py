@@ -2,16 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Realistic Hybrid CPS VR Pipeline (Dynamic Power/Latency)
--------------------------------------------------------
-特点：
-- 非线性功率：P ~ util * (1 + pow_nl_gain * util^2) * load_factor * temp_factor
-- 非线性延迟：L ~ util * (1 + lat_nl_gain * util^2) * power_effect + task_load
-- 温度动态 + 热降频
-- 协同调度使用“软功率上限”（超标阈值才压缩），允许功率曲线出现自然起伏
-- 控制环更敏感（更快的低通系数），功率/延迟/画质出现可见联动
-- 批量运行：independent(2台) + cooperative(多台)
-
-依赖：numpy simpy matplotlib（pandas 可选用于CSV）
 """
 
 import os, math, argparse
@@ -31,17 +21,17 @@ except Exception:
 # ===================== 配置 =====================
 @dataclass
 class DeviceParams:
-    target_latency_ms: float = 16.7         # ~60 FPS
+    target_latency_ms: float = 16.7
     quality_min: float = 0.35
-    q_rate_limit: float = 1.8               # dq/dt 限制（每秒）
+    q_rate_limit: float = 1.8
 
     latency_base_ms: float = 5.0
-    k_latency_util: float = 22.0            # util 对延迟的灵敏度
+    k_latency_util: float = 22.0
     k_latency_tasks: float = 0.6
 
     power_base: float = 5.0
-    alpha_util_to_power: float = 35.0       # 线性部分系数
-    pow_nl_gain: float = 0.9                # 非线性放大（util^2）
+    alpha_util_to_power: float = 35.0
+    pow_nl_gain: float = 0.9
 
     lat_nl_gain: float = 1.3
 
@@ -53,21 +43,21 @@ class DeviceParams:
     jitter_sensitivity: float = 0.8
     motion_sensitivity: float = 0.5
 
-    t_ambient: float = 40.0                 # 等效芯片环境温度（°C）
-    t_rise_gain: float = 0.065              # dT/dt ≈ rise_gain * P - cool_gain * (T - Ta)
+    t_ambient: float = 40.0
+    t_rise_gain: float = 0.065
     t_cool_gain: float = 0.045
-    t_throttle: float = 78.0                # 软降频阈值
-    t_hardcap: float = 86.0                 # 强降频阈值
+    t_throttle: float = 78.0
+    t_hardcap: float = 86.0
 
-    throttle_util_cap: float = 0.65         # 软降频：最大util
-    hardcap_util_cap: float = 0.45          # 强降频：最大util
-    thermal_latency_penalty_ms: float = 6.0 # 过热额外延迟
+    throttle_util_cap: float = 0.65
+    hardcap_util_cap: float = 0.45
+    thermal_latency_penalty_ms: float = 6.0
 
 
 @dataclass
 class GlobalParams:
     power_budget: float = 95.0
-    scheduler_period: float = 0.2           # ☆ 更慢的调度周期，显露功率起伏
+    scheduler_period: float = 0.2
     control_dt: float = 0.01
     sim_time: float = 30.0
     num_devices: int = 2
@@ -79,18 +69,16 @@ class WorkloadProfile:
     motion_amp: float = 1.0
     motion_freq: float = 0.6
     task_load_base: float = 1.0
-    task_load_var: float = 0.35             # ☆ 更强的任务振幅，驱动功率/延迟波动
-    net_sync_ms: float = 0.25               # 协同模式额外同步开销（均值）
-    net_jitter_ms: float = 0.15             # 网络抖动
+    task_load_var: float = 0.35
+    net_sync_ms: float = 0.25
+    net_jitter_ms: float = 0.15
 
 
-# ===================== 工具函数 =====================
 def clamp(x, lo, hi): return max(lo, min(hi, x))
 def lowpass(prev, new, alpha): return alpha * new + (1 - alpha) * prev
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
 
-# ===================== 设备模型 =====================
 class VRDevice:
     def __init__(self, env: simpy.Environment, idx: int, gp: GlobalParams, dp: DeviceParams,
                  wp: WorkloadProfile, rng: np.random.Generator, cooperative: bool, hetero: dict):
@@ -127,21 +115,18 @@ class VRDevice:
                                0.5, 1.8)
 
     def map_q_to_util(self, q) -> float:
-        # 渲染质量→util（凸），含少量偏置
         return clamp(self.ht["util_bias"] + (1 - self.ht["util_bias"]) * (q ** 1.6), 0.0, 1.0)
 
     def map_util_to_power(self, util) -> float:
-        # 非线性功率 + 负载/温度影响（☆关键以产生功率起伏）
         nonlinear = 1.0 + self.dp.pow_nl_gain * (util ** 2)
-        load_factor = 1.0 + 0.25 * (self.task_load - 1.0)            # 任务重 → 功率高
-        temp_factor = 1.0 + 0.015 * (self.temperature - self.dp.t_ambient)  # 温度高 → 功率更高
+        load_factor = 1.0 + 0.25 * (self.task_load - 1.0)
+        temp_factor = 1.0 + 0.015 * (self.temperature - self.dp.t_ambient)
         return (self.dp.power_base * self.ht["p_base_mul"]
                 + self.dp.alpha_util_to_power * util * nonlinear * load_factor * temp_factor * self.ht["p_dyn_mul"])
 
     def map_states_to_latency(self, util) -> float:
-        # 非线性延迟 + 任务量 + 功率负效应（☆功率过高延迟更差）
         nonlinear = 1.0 + self.dp.lat_nl_gain * (util ** 2)
-        power_effect = 1.0 + 0.003 * max(0.0, self.power - self.dp.power_base)  # 高功率→效率下降
+        power_effect = 1.0 + 0.003 * max(0.0, self.power - self.dp.power_base)
         L = (self.dp.latency_base_ms * self.ht["l_base_mul"] +
              self.dp.k_latency_util * util * nonlinear * power_effect * self.ht["l_util_mul"] +
              self.dp.k_latency_tasks * self.task_load * self.ht["l_task_mul"])
@@ -155,7 +140,7 @@ class VRDevice:
 
     def thermal_update(self, dt: float):
         dT = self.dp.t_rise_gain * self.power - self.dp.t_cool_gain * (self.temperature - self.dp.t_ambient)
-        self.temperature += dT * (dt * 60.0)  # 放大到“每分钟”尺度，增强可视
+        self.temperature += dT * (dt * 60.0)
         self.temperature = clamp(self.temperature, self.dp.t_ambient - 5.0, 100.0)
 
     def thermal_caps(self) -> Tuple[float, float]:
@@ -213,7 +198,6 @@ class VRDevice:
             yield self.env.timeout(dt)
 
 
-# ===================== 调度器 =====================
 class CooperativeScheduler:
     def __init__(self, env, devices: List[VRDevice], gp: GlobalParams, dp: DeviceParams):
         self.env, self.devices, self.gp, self.dp = env, devices, gp, dp
@@ -221,12 +205,9 @@ class CooperativeScheduler:
 
     def run(self):
         while True:
-            # 需求：延迟越高越需要
             lat_err = np.array([d.latency_ms - d.dp.target_latency_ms for d in self.devices])
             need = np.maximum(lat_err, 0.0)
-            # 画质压力
             q_pressure = np.array([max(0.0, d.dp.quality_min - d.quality) for d in self.devices])
-            # 温度惩罚：过热的设备权重下降，给它降温
             therm_penalty = np.array([1.0 if d.temperature < d.dp.t_throttle else 0.6 for d in self.devices])
 
             weights = (1.0 + need) + 2.0 * q_pressure
@@ -237,13 +218,12 @@ class CooperativeScheduler:
             else:
                 allocs = weights / weights.sum()
 
-            # 估算功率并施加 ☆软功率上限（超过预算15%才压缩，且保留余量）
             base = sum(d.dp.power_base * d.ht["p_base_mul"] for d in self.devices)
             alpha = self.dp.alpha_util_to_power
             est_dyn = sum(alpha * a * (1.0 + self.dp.pow_nl_gain * (a ** 2)) * d.ht["p_dyn_mul"] for a, d in zip(allocs, self.devices))
             power_if_alloc = base + est_dyn
 
-            if power_if_alloc > 1.15 * self.gp.power_budget:  # ☆仅当明显超标才压缩
+            if power_if_alloc > 1.15 * self.gp.power_budget:
                 scale = max(0.6, (self.gp.power_budget - base) / (est_dyn + 1e-9))
                 allocs *= scale
 
@@ -281,7 +261,6 @@ class IndependentScheduler:
             yield self.env.timeout(self.gp.scheduler_period)
 
 
-# ===================== 仿真主流程 =====================
 def draw_heterogeneity(rng: np.random.Generator):
     return {
         "p_base_mul": float(np.clip(rng.normal(1.0, 0.07), 0.85, 1.2)),
