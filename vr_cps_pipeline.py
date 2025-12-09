@@ -31,22 +31,18 @@ except Exception:
 # ===================== 配置 =====================
 @dataclass
 class DeviceParams:
-    # 控制目标
     target_latency_ms: float = 16.7         # ~60 FPS
     quality_min: float = 0.35
     q_rate_limit: float = 1.8               # dq/dt 限制（每秒）
 
-    # 基础延迟
     latency_base_ms: float = 5.0
     k_latency_util: float = 22.0            # util 对延迟的灵敏度
     k_latency_tasks: float = 0.6
 
-    # 功率模型（线性 + 非线性部分）
     power_base: float = 5.0
     alpha_util_to_power: float = 35.0       # 线性部分系数
     pow_nl_gain: float = 0.9                # 非线性放大（util^2）
 
-    # 延迟非线性（高util时延迟加速上升）
     lat_nl_gain: float = 1.3
 
     # PID
@@ -54,18 +50,15 @@ class DeviceParams:
     pid_ki: float = 0.28
     pid_kd: float = 0.0
 
-    # 质量惩罚
     jitter_sensitivity: float = 0.8
     motion_sensitivity: float = 0.5
 
-    # 热模型
     t_ambient: float = 40.0                 # 等效芯片环境温度（°C）
     t_rise_gain: float = 0.065              # dT/dt ≈ rise_gain * P - cool_gain * (T - Ta)
     t_cool_gain: float = 0.045
     t_throttle: float = 78.0                # 软降频阈值
     t_hardcap: float = 86.0                 # 强降频阈值
 
-    # 热降频效果
     throttle_util_cap: float = 0.65         # 软降频：最大util
     hardcap_util_cap: float = 0.45          # 强降频：最大util
     thermal_latency_penalty_ms: float = 6.0 # 过热额外延迟
@@ -104,10 +97,8 @@ class VRDevice:
         self.env, self.idx, self.gp, self.dp, self.wp, self.rng = env, idx, gp, dp, wp, rng
         self.cooperative = cooperative
 
-        # 设备异质性
         self.ht = hetero
 
-        # 状态
         self.q = clamp(0.55 + 0.1 * rng.standard_normal(), 0.3, 0.85)
         self.q_int = 0.0
         self.util = 0.0
@@ -118,20 +109,16 @@ class VRDevice:
         self.clock_drift_ms = 0.0
         self.temperature = dp.t_ambient + rng.uniform(-2, 2)
 
-        # 外源信号
         self.motion = 0.0
         self.task_load = wp.task_load_base
 
-        # 调度器写入的 util 上限
         self.util_allocation = 1.0 / gp.num_devices
 
-        # 记录
         self.logs = {k: [] for k in
                      ["t","q","util","latency","power","quality","motion","taskload","drift","temp"]}
 
         env.process(self.control_loop())
 
-    # --- 外源信号更新 ---
     def update_exogenous(self, t):
         self.motion = abs(self.wp.motion_amp * math.sin(2 * math.pi * self.wp.motion_freq * t)) \
                       + 0.1 * self.rng.standard_normal()
@@ -139,7 +126,6 @@ class VRDevice:
         self.task_load = clamp(base + 0.5*var*math.sin(2*math.pi*0.12*t) + 0.25*self.rng.standard_normal(),
                                0.5, 1.8)
 
-    # --- 映射 ---
     def map_q_to_util(self, q) -> float:
         # 渲染质量→util（凸），含少量偏置
         return clamp(self.ht["util_bias"] + (1 - self.ht["util_bias"]) * (q ** 1.6), 0.0, 1.0)
@@ -167,7 +153,6 @@ class VRDevice:
         mot_penalty = 1.0 / (1.0 + self.dp.motion_sensitivity * max(0.0, motion))
         return clamp(q * lat_penalty * jit_penalty * mot_penalty, 0.0, 1.0)
 
-    # --- 热动态 ---
     def thermal_update(self, dt: float):
         dT = self.dp.t_rise_gain * self.power - self.dp.t_cool_gain * (self.temperature - self.dp.t_ambient)
         self.temperature += dT * (dt * 60.0)  # 放大到“每分钟”尺度，增强可视
@@ -180,7 +165,6 @@ class VRDevice:
             return self.dp.throttle_util_cap, self.dp.thermal_latency_penalty_ms
         return 1.0, 0.0
 
-    # --- 连续控制 ---
     def control_update(self, dt: float):
         util_cap_sched = self.util_allocation
         util_cap_therm, extra_lat_ms = self.thermal_caps()
@@ -188,7 +172,6 @@ class VRDevice:
         util_demand = self.map_q_to_util(self.q)
         self.util = min(util_demand, util_cap_sched, util_cap_therm)
 
-        # 先计算功率（供延迟中 power_effect 使用），再算延迟
         self.power = self.map_util_to_power(self.util)
         latency = self.map_states_to_latency(self.util)
 
@@ -197,13 +180,11 @@ class VRDevice:
 
         latency += extra_lat_ms
 
-        # ☆ 更快的低通，使得短时波动可见
         self.latency_ms_avg = lowpass(self.latency_ms_avg, latency, alpha=0.3)
         jitter = abs(latency - self.latency_ms_avg)
 
         self.quality = self.map_to_quality(latency, self.motion, jitter, self.q)
 
-        # PI 控制
         err = latency - self.dp.target_latency_ms
         self.q_int += err * dt
         dq = -(self.dp.pid_kp * err + self.dp.pid_ki * self.q_int)
@@ -214,7 +195,6 @@ class VRDevice:
         self.q = clamp(self.q + dq, 0.1, 1.0)
         self.latency_ms = latency
 
-        # 漂移与温度
         self.clock_drift_ms += 0.001 * (latency - self.dp.latency_base_ms) * dt
         self.thermal_update(dt)
 
@@ -235,9 +215,6 @@ class VRDevice:
 
 # ===================== 调度器 =====================
 class CooperativeScheduler:
-    """
-    需求加权 + 温度惩罚 + ☆软功率上限（超过阈值才统一压缩）
-    """
     def __init__(self, env, devices: List[VRDevice], gp: GlobalParams, dp: DeviceParams):
         self.env, self.devices, self.gp, self.dp = env, devices, gp, dp
         env.process(self.run())
@@ -277,9 +254,6 @@ class CooperativeScheduler:
 
 
 class IndependentScheduler:
-    """
-    各自为政：根据自身 q 追求 util；若总功率明显超标，则统一缩放
-    """
     def __init__(self, env, devices: List[VRDevice], gp: GlobalParams, dp: DeviceParams):
         self.env, self.devices, self.gp, self.dp = env, devices, gp, dp
         env.process(self.run())
@@ -390,12 +364,10 @@ def main():
     outroot = "./outputs"
     ensure_dir(outroot)
 
-    # 独立基线（固定2台，便于对比）
     gp = GlobalParams(sim_time=args.sim_time, num_devices=2, seed=args.seed,
                       power_budget=args.power_budget, scheduler_period=args.sched_period)
     run_sim("independent", gp, dp, wp, os.path.join(outroot, "independent"))
 
-    # 协同多设备
     for n in args.devices:
         gp = GlobalParams(sim_time=args.sim_time, num_devices=n, seed=args.seed,
                           power_budget=args.power_budget, scheduler_period=args.sched_period)

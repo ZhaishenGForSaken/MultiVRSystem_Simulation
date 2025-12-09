@@ -143,7 +143,7 @@ class VRDevice:
                 self.logs["t"].append(t)
                 for k in ["q", "util", "latency", "power", "quality", "motion", "taskload", "temp"]:
                     if k == "temp":
-                        self.logs[k].append(self.temperature)  # 温度维持不变
+                        self.logs[k].append(self.temperature)
                     else:
                         self.logs[k].append(0)
                 yield self.env.timeout(dt)
